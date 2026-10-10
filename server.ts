@@ -381,7 +381,7 @@ async function handleTelegramCallbackQuery(callbackQuery: any) {
     if (!urls || urls.length === 0) {
       await callTelegram('sendMessage', {
         chat_id: chatId,
-        text: `❌ Pinterest par "${query}" ke liye koi image nahi mili.`,
+        text: `❌ No images found on Pinterest for "${query}".`,
       });
       addLog(user, query, 'error', 'No images found');
       return;
@@ -486,7 +486,7 @@ async function handleTelegramCallbackQuery(callbackQuery: any) {
     } else {
       await callTelegram('sendMessage', {
         chat_id: chatId,
-        text: `❌ Images deliver nahi ho saki. Please try another keyword.`,
+        text: `❌ Could not deliver images. Please try another keyword.`,
       });
       addLog(user, query, 'error', 'Delivery failed');
     }
@@ -580,7 +580,7 @@ async function handleTelegramMessage(message: any) {
     chat_id: chatId,
     text:
       `🔍 *Search:* \`${query}\`\n\n` +
-      `Kitni images chahiye? Select karein:`,
+      `How many images would you like? Select below:`,
     parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [
