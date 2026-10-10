@@ -2,9 +2,11 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import axios from 'axios';
 import https from 'https';
+import path from 'path';
+import fs from 'fs';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
@@ -95,46 +97,112 @@ async function searchViaSiputzx(query: string): Promise<string[]> {
 }
 
 /**
- * 3. Fallback direct Pinterest public scraper
+ * 3. Robust multi-term Pinterest harvester with pagination
  */
-async function searchViaPinterestDirect(query: string): Promise<string[]> {
-  try {
-    const res = await axiosClient.get(
-      `https://www.pinterest.com/resource/BaseSearchResource/get/`,
-      {
-        params: {
-          source_url: `/search/pins/?q=${encodeURIComponent(query)}`,
-          data: JSON.stringify({
-            options: {
-              query,
-              scope: 'pins',
-              page_size: 25,
-            },
-            context: {},
-          }),
-        },
-        headers: {
-          'X-Requested-With': 'XMLHttpRequest',
-          Referer: 'https://www.pinterest.com/',
-        },
-        timeout: 6000,
-      }
-    );
+async function searchViaPinterestDirect(query: string, targetCount: number = 30): Promise<string[]> {
+  const urls: string[] = [];
+  const seen = new Set<string>();
 
-    const results = res.data?.resource_response?.data?.results || [];
-    const urls: string[] = [];
-    for (const pin of results) {
-      const img =
-        pin.images?.orig?.url ||
-        pin.images?.['736x']?.url ||
-        pin.images?.['564x']?.url;
-      if (img) {
-        urls.push(upgradeToOriginals(img));
+  const addImage = (img: string) => {
+    if (img && typeof img === 'string') {
+      const orig = upgradeToOriginals(img);
+      if (!seen.has(orig)) {
+        seen.add(orig);
+        urls.push(orig);
       }
     }
-    return urls;
-  } catch (_) {}
-  return [];
+  };
+
+  const terms = [
+    query,
+    `${query} wallpaper`,
+    `${query} aesthetic`,
+    `${query} 4k`,
+    `${query} art`,
+    `${query} background`,
+    `${query} photography`,
+    `${query} illustration`,
+  ];
+
+  // Run multi-term queries concurrently
+  const searchPromises = terms.map(async (term) => {
+    try {
+      const res = await axiosClient.get(
+        `https://www.pinterest.com/resource/BaseSearchResource/get/`,
+        {
+          params: {
+            source_url: `/search/pins/?q=${encodeURIComponent(term)}`,
+            data: JSON.stringify({
+              options: { query: term, scope: 'pins', page_size: 25 },
+              context: {},
+            }),
+          },
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            Referer: 'https://www.pinterest.com/',
+          },
+          timeout: 6000,
+        }
+      );
+      const results = res.data?.resource_response?.data?.results || [];
+      for (const pin of results) {
+        const img =
+          pin.images?.orig?.url ||
+          pin.images?.['736x']?.url ||
+          pin.images?.['564x']?.url;
+        if (img) addImage(img);
+      }
+    } catch (_) {}
+  });
+
+  await Promise.allSettled(searchPromises);
+
+  // If still below targetCount, use cursor pagination on primary query
+  let bookmark: string | undefined = undefined;
+  let attempts = 0;
+  while (urls.length < targetCount && attempts < 6) {
+    attempts++;
+    try {
+      const optionsObj: any = {
+        query,
+        scope: 'pins',
+        page_size: 25,
+      };
+      if (bookmark) optionsObj.bookmarks = [bookmark];
+
+      const res = await axiosClient.get(
+        `https://www.pinterest.com/resource/BaseSearchResource/get/`,
+        {
+          params: {
+            source_url: `/search/pins/?q=${encodeURIComponent(query)}`,
+            data: JSON.stringify({ options: optionsObj, context: {} }),
+          },
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            Referer: 'https://www.pinterest.com/',
+          },
+          timeout: 6000,
+        }
+      );
+
+      const resData = res.data?.resource_response;
+      const results = resData?.data?.results || [];
+      if (!Array.isArray(results) || results.length === 0) break;
+      for (const pin of results) {
+        const img =
+          pin.images?.orig?.url ||
+          pin.images?.['736x']?.url ||
+          pin.images?.['564x']?.url;
+        if (img) addImage(img);
+      }
+      bookmark = resData?.bookmark;
+      if (!bookmark || bookmark === '-end-') break;
+    } catch (_) {
+      break;
+    }
+  }
+
+  return urls;
 }
 
 /**
@@ -153,34 +221,19 @@ async function searchPinterest(query: string, maxResults: number = 10): Promise<
     }
   };
 
-  const results = await new Promise<string[]>((resolve) => {
-    let settledCount = 0;
-    let isResolved = false;
+  // Run initial fast APIs in parallel
+  const [nexrayList, siputzxList] = await Promise.all([
+    searchViaNexray(query).catch(() => []),
+    searchViaSiputzx(query).catch(() => []),
+  ]);
 
-    const handleResult = (urls: string[]) => {
-      settledCount++;
-      addUnique(urls);
+  addUnique(nexrayList);
+  addUnique(siputzxList);
 
-      if (!isResolved && combinedUrls.length >= maxResults) {
-        isResolved = true;
-        resolve(combinedUrls.slice(0, maxResults));
-        return;
-      }
-
-      if (settledCount >= 2 && !isResolved) {
-        isResolved = true;
-        resolve(combinedUrls);
-      }
-    };
-
-    searchViaNexray(query).then(handleResult).catch(() => handleResult([]));
-    searchViaSiputzx(query).then(handleResult).catch(() => handleResult([]));
-  });
-
-  // If we need more results for large counts (30, 50, 100), supplement from direct search
+  // If more images needed, fetch from Pinterest with multi-query aggregator
   if (combinedUrls.length < maxResults) {
-    const fallback = await searchViaPinterestDirect(query);
-    addUnique(fallback);
+    const directList = await searchViaPinterestDirect(query, maxResults);
+    addUnique(directList);
   }
 
   return combinedUrls.slice(0, maxResults);
@@ -258,12 +311,12 @@ function addLog(user: string, query: string, status: 'success' | 'error' | 'info
 }
 
 /**
- * Telegram API Helpers
+ * Telegram API Helpers (with generous 60s timeout for large media groups)
  */
 async function callTelegram(method: string, data: any) {
   if (!currentBotToken) throw new Error('No bot token set');
   const res = await axios.post(`https://api.telegram.org/bot${currentBotToken}/${method}`, data, {
-    timeout: 15000,
+    timeout: 60000,
   });
   return res.data;
 }
@@ -292,7 +345,7 @@ async function handleTelegramCallbackQuery(callbackQuery: any) {
     try {
       await callTelegram('answerCallbackQuery', {
         callback_query_id: callbackId,
-        text: 'Search cancelled.',
+        text: 'Cancelled.',
       });
       await callTelegram('editMessageText', {
         chat_id: chatId,
@@ -316,12 +369,12 @@ async function handleTelegramCallbackQuery(callbackQuery: any) {
     await callTelegram('editMessageText', {
       chat_id: chatId,
       message_id: messageId,
-      text: `⏳ *Scraping ${count} HD Pinterest images for:* \`${query}\`...\n_Please wait, fetching results..._`,
+      text: `⏳ Fetching ${count} images for: \`${query}\`...`,
       parse_mode: 'Markdown',
     });
   } catch (_) {}
 
-  addLog(user, `${query} (${count})`, 'info', `Scraping ${count} images...`);
+  addLog(user, `${query} (${count})`, 'info', `Fetching ${count} images...`);
 
   try {
     const urls = await searchPinterest(query, count);
@@ -337,43 +390,99 @@ async function handleTelegramCallbackQuery(callbackQuery: any) {
     const actualUrls = urls.slice(0, count);
     let sentCount = 0;
     const chunkSize = 10; // Telegram album limit is 10 photos
+    const totalBatches = Math.ceil(actualUrls.length / chunkSize);
 
-    for (let i = 0; i < actualUrls.length; i += chunkSize) {
-      const chunk = actualUrls.slice(i, i + chunkSize);
-      const media = chunk.map((url, idx) => ({
+    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+      const chunk = actualUrls.slice(batchIdx * chunkSize, (batchIdx + 1) * chunkSize);
+      const media = chunk.map((url) => ({
         type: 'photo',
         media: url,
-        caption: i === 0 && idx === 0 ? `📌 *Pinterest HD:* \`${query}\` (${actualUrls.length} images)` : undefined,
-        parse_mode: 'Markdown',
       }));
 
+      let batchSuccess = false;
+
+      // 1. Send as Telegram mediaGroup
       try {
         await callTelegram('sendMediaGroup', {
           chat_id: chatId,
-          media: JSON.stringify(media),
+          media: media,
         });
         sentCount += chunk.length;
-      } catch (err) {
-        // Fallback: send individually if media group fails
-        for (const singleUrl of chunk) {
+        batchSuccess = true;
+      } catch (err: any) {
+        // If 429 rate limit, respect retry_after
+        if (err.response?.status === 429) {
+          const retryAfter = (err.response?.data?.parameters?.retry_after || 3) * 1000;
+          await new Promise((r) => setTimeout(r, retryAfter + 1000));
           try {
-            await callTelegram('sendPhoto', {
+            await callTelegram('sendMediaGroup', {
               chat_id: chatId,
-              photo: singleUrl,
+              media: media,
             });
-            sentCount++;
+            sentCount += chunk.length;
+            batchSuccess = true;
           } catch (_) {}
+        }
+
+        // 2. Fallback to individual sendPhoto if media group fails
+        if (!batchSuccess) {
+          for (const singleUrl of chunk) {
+            try {
+              await callTelegram('sendPhoto', {
+                chat_id: chatId,
+                photo: singleUrl,
+              });
+              sentCount++;
+              await new Promise((r) => setTimeout(r, 350));
+            } catch (pErr: any) {
+              if (pErr.response?.status === 429) {
+                const wait = (pErr.response?.data?.parameters?.retry_after || 3) * 1000;
+                await new Promise((r) => setTimeout(r, wait + 1000));
+                try {
+                  await callTelegram('sendPhoto', {
+                    chat_id: chatId,
+                    photo: singleUrl,
+                  });
+                  sentCount++;
+                } catch (_) {}
+              }
+            }
+          }
         }
       }
 
-      // Small delay between albums to prevent flood limit
-      if (i + chunkSize < actualUrls.length) {
-        await new Promise((r) => setTimeout(r, 1200));
+      // Update progress for user during 50 and 100 image delivery
+      if (batchIdx < totalBatches - 1) {
+        try {
+          await callTelegram('editMessageText', {
+            chat_id: chatId,
+            message_id: messageId,
+            text: `⏳ Sent ${sentCount}/${actualUrls.length} images for: \`${query}\`...`,
+            parse_mode: 'Markdown',
+          });
+        } catch (_) {}
+
+        // Small breathing delay between albums to satisfy Telegram rate limits
+        await new Promise((r) => setTimeout(r, 1500));
       }
     }
 
     if (sentCount > 0) {
       addLog(user, query, 'success', `Delivered ${sentCount} images`);
+      try {
+        await callTelegram('editMessageText', {
+          chat_id: chatId,
+          message_id: messageId,
+          text: `✅ Sent ${sentCount} images for: \`${query}\``,
+          parse_mode: 'Markdown',
+        });
+      } catch (_) {
+        await callTelegram('sendMessage', {
+          chat_id: chatId,
+          text: `✅ Sent ${sentCount} images for: \`${query}\``,
+          parse_mode: 'Markdown',
+        });
+      }
     } else {
       await callTelegram('sendMessage', {
         chat_id: chatId,
@@ -385,7 +494,7 @@ async function handleTelegramCallbackQuery(callbackQuery: any) {
     addLog(user, query, 'error', err?.message || 'Scrape failed');
     await callTelegram('sendMessage', {
       chat_id: chatId,
-      text: `❌ Error scraping Pinterest images.`,
+      text: `❌ Error fetching images.`,
     });
   } finally {
     pendingSearches.delete(sessionId);
@@ -412,12 +521,12 @@ async function handleTelegramMessage(message: any) {
     await callTelegram('sendMessage', {
       chat_id: chatId,
       text:
-        `👋 *Welcome to Pinterest HD Bot!*\n\n` +
+        `👋 *Welcome to Pinterest Bot!*\n\n` +
         `Send me any keyword, and select how many images you want!\n\n` +
         `*Examples:*\n` +
         `• \`anime wallpaper\`\n` +
         `• \`cyberpunk aesthetic\`\n` +
-        `• \`vintage cars 4k\`\n` +
+        `• \`vintage cars\`\n` +
         `• Or paste a link: \`https://pin.it/...\``,
       parse_mode: 'Markdown',
     });
@@ -433,7 +542,7 @@ async function handleTelegramMessage(message: any) {
     addLog(username, query, 'info', 'Downloading Pinterest URL...');
     await callTelegram('sendMessage', {
       chat_id: chatId,
-      text: '⏳ *Fetching HD Pinterest Media...*',
+      text: '⏳ Fetching media...',
       parse_mode: 'Markdown',
     });
 
@@ -443,22 +552,18 @@ async function handleTelegramMessage(message: any) {
         await callTelegram('sendVideo', {
           chat_id: chatId,
           video: media.video,
-          caption: '✨ *Downloaded from Pinterest*',
-          parse_mode: 'Markdown',
         });
       } else if (media.image) {
         await callTelegram('sendPhoto', {
           chat_id: chatId,
           photo: media.image,
-          caption: '✨ *Downloaded from Pinterest*',
-          parse_mode: 'Markdown',
         });
       }
       addLog(username, query, 'success', 'Sent media from URL');
     } else {
       await callTelegram('sendMessage', {
         chat_id: chatId,
-        text: '❌ *Failed to download media from this Pinterest link.*',
+        text: '❌ Failed to download media from this Pinterest link.',
         parse_mode: 'Markdown',
       });
       addLog(username, query, 'error', 'Failed to resolve URL');
@@ -474,19 +579,19 @@ async function handleTelegramMessage(message: any) {
   await callTelegram('sendMessage', {
     chat_id: chatId,
     text:
-      `📌 *Pinterest Search:* \`${query}\`\n\n` +
-      `Kitni HD images chahiye? Choose karein:`,
+      `🔍 *Search:* \`${query}\`\n\n` +
+      `Kitni images chahiye? Select karein:`,
     parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [
         [
-          { text: '10 Images', callback_data: `cnt:10:${sessionId}` },
-          { text: '20 Images', callback_data: `cnt:20:${sessionId}` },
-          { text: '30 Images', callback_data: `cnt:30:${sessionId}` },
+          { text: '10', callback_data: `cnt:10:${sessionId}` },
+          { text: '20', callback_data: `cnt:20:${sessionId}` },
+          { text: '30', callback_data: `cnt:30:${sessionId}` },
         ],
         [
-          { text: '50 Images', callback_data: `cnt:50:${sessionId}` },
-          { text: '100 Images', callback_data: `cnt:100:${sessionId}` },
+          { text: '50', callback_data: `cnt:50:${sessionId}` },
+          { text: '100', callback_data: `cnt:100:${sessionId}` },
         ],
         [
           { text: '❌ Cancel', callback_data: `cnt:cancel:${sessionId}` },
@@ -605,14 +710,42 @@ app.post('/api/bot/test-search', async (req, res) => {
   }
 });
 
-// Vite integration
+// Vite integration and server boot
 async function startServer() {
-  const vite = await createViteServer({
-    server: { middlewareMode: true },
-    appType: 'spa',
-  });
+  const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(path.resolve('dist'));
 
-  app.use(vite.middlewares);
+  if (isProd) {
+    app.use(express.static(path.resolve('dist')));
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api')) return next();
+      res.sendFile(path.resolve('dist', 'index.html'));
+    });
+  } else {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  // Auto-start bot on Railway if BOT_TOKEN environment variable is provided
+  const envToken = (process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  if (envToken) {
+    try {
+      console.log('Detected BOT_TOKEN in environment, connecting to Telegram...');
+      const check = await axios.get(`https://api.telegram.org/bot${envToken}/getMe`, { timeout: 8000 });
+      if (check.data?.ok && check.data.result) {
+        currentBotToken = envToken;
+        botInfo = check.data.result;
+        pollingOffset = 0;
+        addLog('System', 'Auto-Start', 'success', `Connected bot @${botInfo.username}`);
+        startTelegramPolling().catch(() => {});
+        console.log(`Bot @${botInfo.username} successfully started in background!`);
+      }
+    } catch (err: any) {
+      console.error('Failed to auto-start bot with BOT_TOKEN:', err?.message);
+    }
+  }
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Pinterest Telegram Bot server running on http://0.0.0.0:${PORT}`);
