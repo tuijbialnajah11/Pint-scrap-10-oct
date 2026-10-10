@@ -1,0 +1,6 @@
+{
+  "name": "BooruNexus",
+  "description": "Advanced anime art imageboard and tag explorer inspired by Gelbooru with rich taxonomy, high-res viewer, and collection pools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
